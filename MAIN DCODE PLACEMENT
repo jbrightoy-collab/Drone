@@ -1,1 +1,274 @@
-WILL MAKE CHANGES LATER. 
+#include "stm32l4xx_hal.h"
+#include <math.h>
+#include <stdio.h>
+
+/* --- DEFINES & REGISTERS --- */
+// I2C address with SA0 (PB14) driven LOW is 0x68 (0xD0 shifted for HAL)
+#define ICM20602_ADDR      0xD0  
+#define DT                 0.01f // 10ms sampling rate
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+// ICM-20602 Register Addresses
+#define WHO_AM_I_REG       0x75
+#define PWR_MGMT_1_REG     0x6B
+#define SMPLRT_DIV_REG     0x19
+#define ACCEL_CONFIG_REG   0x1C
+#define GYRO_CONFIG_REG    0x1B
+#define ACCEL_XOUT_H_REG   0x3B
+
+/* --- EXTERNAL PERIPHERAL HANDLES --- */
+// Configured in CubeMX: I2C2 uses PB13 (SCL) and PB15 (SDA)
+extern I2C_HandleTypeDef hi2c2;  
+extern TIM_HandleTypeDef htim1;  // Motor PWM
+extern TIM_HandleTypeDef htim2;  // RC Input Capture
+extern UART_HandleTypeDef huart1;// Debug / Telemetry
+
+/* --- DATA STRUCTURES --- */
+typedef struct {
+    int16_t Accel_X_RAW, Accel_Y_RAW, Accel_Z_RAW;
+    float Ax, Ay, Az;
+    
+    int16_t Gyro_X_RAW, Gyro_Y_RAW, Gyro_Z_RAW;
+    float Gx, Gy, Gz;
+    
+    float roll, pitch, yaw;
+} ICM20602_t;
+
+typedef struct {
+    float Kp, Ki, Kd;
+    float error, previous_error;
+    float integral, derivative;
+    float output, output_limit;
+} PID_t;
+
+/* --- GLOBAL VARIABLES --- */
+ICM20602_t icm;
+PID_t pid_roll, pid_pitch, pid_yaw;
+
+uint16_t rc_throttle = 0;
+uint16_t rc_roll = 0;
+uint16_t rc_pitch = 0;
+uint16_t rc_yaw = 0;
+uint32_t last_rc_time = 0;
+
+uint16_t motor1_output = 0;
+uint16_t motor2_output = 0;
+uint16_t motor3_output = 0;
+uint16_t motor4_output = 0;
+
+/* --- PERIPHERAL INITIALIZATION PROTOTYPES --- */
+void SystemClock_Config(void);
+void MX_GPIO_Init(void);
+void MX_I2C2_Init(void);
+void MX_TIM1_Init(void);
+void MX_TIM2_Init(void);
+void MX_USART1_UART_Init(void);
+
+/* --- ICM-20602 SENSOR FUNCTIONS --- */
+uint8_t ICM20602_Init(void) {
+    uint8_t check, data;
+    
+    // Check device ID (ICM-20602 WHO_AM_I default is 0x12)
+    HAL_I2C_Mem_Read(&hi2c2, ICM20602_ADDR, WHO_AM_I_REG, 1, &check, 1, 1000);
+    
+    if (check == 0x12) {  
+        // Wake up the ICM-20602 and select auto clock source
+        data = 0x01;
+        HAL_I2C_Mem_Write(&hi2c2, ICM20602_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
+        
+        // Set DATA RATE of 1KHz
+        data = 0x07;
+        HAL_I2C_Mem_Write(&hi2c2, ICM20602_ADDR, SMPLRT_DIV_REG, 1, &data, 1, 1000);
+        
+        // Configure accelerometer (+/-4g sensitivity -> 8192 LSB/g)
+        data = 0x08;
+        HAL_I2C_Mem_Write(&hi2c2, ICM20602_ADDR, ACCEL_CONFIG_REG, 1, &data, 1, 1000);
+        
+        // Configure gyroscope (500 deg/s sensitivity -> 65.5 LSB/(dps))
+        data = 0x08;
+        HAL_I2C_Mem_Write(&hi2c2, ICM20602_ADDR, GYRO_CONFIG_REG, 1, &data, 1, 1000);
+        
+        return 0;  // Success
+    }
+    return 1;  // Error
+}
+
+void ICM20602_Read_All(ICM20602_t *DataStruct) {
+    uint8_t data[14];
+    
+    // Read 14 bytes starting from ACCEL_XOUT_H
+    HAL_I2C_Mem_Read(&hi2c2, ICM20602_ADDR, ACCEL_XOUT_H_REG, 1, data, 14, 1000);
+    
+    DataStruct->Accel_X_RAW = (int16_t)(data[0] << 8 | data[1]);
+    DataStruct->Accel_Y_RAW = (int16_t)(data[2] << 8 | data[3]);
+    DataStruct->Accel_Z_RAW = (int16_t)(data[4] << 8 | data[5]);
+    
+    DataStruct->Gyro_X_RAW = (int16_t)(data[8] << 8 | data[9]);
+    DataStruct->Gyro_Y_RAW = (int16_t)(data[10] << 8 | data[11]);
+    DataStruct->Gyro_Z_RAW = (int16_t)(data[12] << 8 | data[13]);
+    
+    // Convert to physical units 
+    DataStruct->Ax = DataStruct->Accel_X_RAW / 8192.0f;
+    DataStruct->Ay = DataStruct->Accel_Y_RAW / 8192.0f;
+    DataStruct->Az = DataStruct->Accel_Z_RAW / 8192.0f;
+    
+    // Convert to angular velocity 
+    DataStruct->Gx = DataStruct->Gyro_X_RAW / 65.5f;
+    DataStruct->Gy = DataStruct->Gyro_Y_RAW / 65.5f;
+    DataStruct->Gz = DataStruct->Gyro_Z_RAW / 65.5f;
+}
+
+void UpdateAttitude(ICM20602_t *DataStruct) {
+    float accel_roll = atan2f(DataStruct->Ay, DataStruct->Az) * 180.0f / M_PI;
+    float accel_pitch = atanf(-DataStruct->Ax / sqrtf(DataStruct->Ay * DataStruct->Ay + 
+                                                      DataStruct->Az * DataStruct->Az)) * 180.0f / M_PI;
+    
+    // Complementary filter
+    DataStruct->roll = 0.98f * (DataStruct->roll + DataStruct->Gx * DT) + 0.02f * accel_roll;
+    DataStruct->pitch = 0.98f * (DataStruct->pitch + DataStruct->Gy * DT) + 0.02f * accel_pitch;
+    DataStruct->yaw += DataStruct->Gz * DT;
+}
+
+/* --- PID FUNCTIONS --- */
+void PID_Init(PID_t *PID, float Kp, float Ki, float Kd, float output_limit) {
+    PID->Kp = Kp;
+    PID->Ki = Ki;
+    PID->Kd = Kd;
+    PID->error = 0;
+    PID->previous_error = 0;
+    PID->integral = 0;
+    PID->derivative = 0;
+    PID->output = 0;
+    PID->output_limit = output_limit;
+}
+
+float PID_Calculate(PID_t *PID, float setpoint, float measurement, float dt) {
+    PID->error = setpoint - measurement;
+    PID->integral += PID->error * dt;
+    
+    if (PID->integral > PID->output_limit) PID->integral = PID->output_limit;
+    else if (PID->integral < -PID->output_limit) PID->integral = -PID->output_limit;
+    
+    PID->derivative = (PID->error - PID->previous_error) / dt;
+    PID->output = (PID->Kp * PID->error) + (PID->Ki * PID->integral) + (PID->Kd * PID->derivative);
+    
+    if (PID->output > PID->output_limit) PID->output = PID->output_limit;
+    else if (PID->output < -PID->output_limit) PID->output = -PID->output_limit;
+    
+    PID->previous_error = PID->error;
+    return PID->output;
+}
+
+/* --- MOTOR CONTROL FUNCTIONS --- */
+void StartPWM(void) {
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); 
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); 
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); 
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); 
+}
+
+void SetMotorSpeed(uint8_t motor, uint16_t speed) {
+    if (speed > 1000) speed = 1000;
+    uint16_t pwm_value = 1000 + speed;
+    
+    switch (motor) {
+        case 1: __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_value); break;
+        case 2: __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_value); break;
+        case 3: __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_value); break;
+        case 4: __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm_value); break;
+    }
+}
+
+/* --- RC INPUT & FAILSAFE --- */
+void UpdateRCTime(void) {
+    last_rc_time = HAL_GetTick();
+}
+
+void CheckFailsafe(void) {
+    uint32_t current_time = HAL_GetTick();
+    if (current_time - last_rc_time > 500) {
+        rc_throttle = rc_throttle > 50 ? rc_throttle - 5 : 0;
+        rc_roll = 500;     
+        rc_pitch = 500;    
+        rc_yaw = 500;      
+    }
+}
+
+/* --- FLIGHT CONTROLLER LOGIC --- */
+void FlightControllerInit(void) {
+    ICM20602_Init();
+    
+    PID_Init(&pid_roll, 1.5f, 0.05f, 0.5f, 400.0f);
+    PID_Init(&pid_pitch, 1.5f, 0.05f, 0.5f, 400.0f);
+    PID_Init(&pid_yaw, 2.0f, 0.1f, 0.0f, 200.0f);
+    
+    StartPWM();
+    HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+}
+
+void FlightControlLoop(void) {
+    ICM20602_Read_All(&icm);
+    UpdateAttitude(&icm);
+    CheckFailsafe();
+    
+    float desired_roll = (rc_roll - 500) * 0.08f;    
+    float desired_pitch = (rc_pitch - 500) * 0.08f;
+    float desired_yaw_rate = (rc_yaw - 500) * 0.4f;  
+    
+    float roll_output = PID_Calculate(&pid_roll, desired_roll, icm.roll, DT);
+    float pitch_output = PID_Calculate(&pid_pitch, desired_pitch, icm.pitch, DT);
+    float yaw_output = PID_Calculate(&pid_yaw, desired_yaw_rate, icm.Gz, DT);
+    
+    uint16_t base_throttle = rc_throttle;
+    
+    motor1_output = base_throttle - roll_output + pitch_output + yaw_output;
+    motor2_output = base_throttle + roll_output + pitch_output - yaw_output;
+    motor3_output = base_throttle + roll_output - pitch_output + yaw_output;
+    motor4_output = base_throttle - roll_output - pitch_output - yaw_output;
+    
+    SetMotorSpeed(1, motor1_output);
+    SetMotorSpeed(2, motor2_output);
+    SetMotorSpeed(3, motor3_output);
+    SetMotorSpeed(4, motor4_output);
+}
+
+/* --- MAIN PROGRAM --- */
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    
+    MX_GPIO_Init();
+    MX_I2C2_Init();
+    MX_TIM1_Init();
+    MX_TIM2_Init();
+    MX_USART1_UART_Init();
+
+    // Force PB14 (SA0) LOW to set the I2C address to 0x68 (0xD0)
+    // Make sure PB14 is configured as a GPIO Output in STM32CubeMX
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+    
+    // Give the sensor a moment to register the SA0 state
+    HAL_Delay(10); 
+    
+    FlightControllerInit();
+    
+    // Arm motors
+    for (int i = 1; i <= 4; i++) {
+        SetMotorSpeed(i, 0);
+    }
+    HAL_Delay(3000); 
+    
+    uint32_t previous_time = HAL_GetTick();
+    
+    while (1) {
+        uint32_t current_time = HAL_GetTick();
+        
+        if (current_time - previous_time >= 10) {
+            FlightControlLoop();
+            previous_time = current_time;
+        }
+    }
+}
